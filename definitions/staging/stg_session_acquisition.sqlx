@@ -1,0 +1,63 @@
+config {
+    type: "incremental",
+    tags: ["session_tables","daily"],
+    uniqueKey: ["session_id"],
+    schema: "staging",
+    description:"Sessionization from GA4 raw data.",
+    bigquery:{
+        partitionBy:"date",
+        clusterBy: ["session_source_medium"],
+        updatePartitionFilter:
+            "date >= date_sub(current_date(),interval 4 DAY)"
+    }
+}
+
+pre_operations {
+declare start_date default (
+    ${when(incremental(),
+    `select max(date) from ${self()}`,
+    `select date(${constants.START_DATE})`)}
+  );
+declare end_date default (
+    select date_sub(current_date(),interval 4 DAY)
+    )   
+}
+  
+
+
+with prep as (
+select
+  cast(event_date as date format 'YYYYMMDD') as date,
+  format_date('%Y%m',parse_date("%Y%m%d",event_date)) as month_of_year,
+  format_date('%Y%U',parse_date("%Y%m%d",event_date)) as week_of_year,
+  user_pseudo_id,
+  concat(user_pseudo_id, (select value.int_value from unnest(event_params) where key = 'ga_session_id')) as session_id,
+  (select value.int_value from unnest(event_params) where key = 'ga_session_id') as session_start,
+  device.category as device_category,
+  traffic_source.source as first_user_source,
+  traffic_source.medium as first_user_medium,
+  traffic_source.name as first_user_campaign,
+  array_agg((select value.string_value from unnest(event_params) where key = 'source') ignore nulls)[offset(0)] as session_source,
+  array_agg((select value.string_value from unnest(event_params) where key = 'medium') ignore nulls)[offset(0)] as session_medium,
+  array_agg((select value.string_value from unnest(event_params) where key = 'campaign') ignore nulls)[offset(0)] as session_campaign,
+  array_agg((select value.string_value from unnest(event_params) where key = 'gclid') ignore nulls)[offset(0)] as gclid,
+  countif(event_name = 'page_view') as page_views,
+  countif(event_name = 'purchase') as transactions,
+  case when event_name = 'purchase' then ecommerce.transaction_id end as transaction_id,
+  sum(ecommerce.purchase_revenue) as total_session_revenue
+from
+    ${ref(constants.GA4_TABLE)}
+
+where
+    cast(event_date as date format 'YYYYMMDD') > start_date and
+    cast(event_date as date format 'YYYYMMDD') <= end_date and
+    contains_substr(_table_suffix, 'intraday') is not true
+
+group by
+  1, 2, 3, 4, 5, 6, 7, 8, 9, 10, transaction_id
+order by
+  date, total_session_revenue DESC
+)
+select *,
+       concat(ifnull(session_source,'(direct)'),' / ',ifnull(session_medium,'(none)')) as session_source_medium
+from prep
